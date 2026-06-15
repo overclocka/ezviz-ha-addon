@@ -96,7 +96,9 @@ while true; do
 
     # Unique segment prefix per session to avoid overwrites during reconnect
     SESSION_ID="${TIMESTAMP}_${RESTART_COUNT}"
-
+    # Avoid broken streams
+    mkdir -p /share/ezviz_hls
+    echo "#EXTM3U" > /share/ezviz_hls/stream.m3u8
     # Start streaming (stderr goes to log, stdout pipes to ffmpeg)
     # || true ensures the loop continues even if ffmpeg exits with error
     python3 -u /app/stream_to_pipe.py \
@@ -104,16 +106,19 @@ while true; do
         --password "${PASSWORD}" \
         --serial "${SERIAL}" \
         --region "${REGION}" | \
+    # Some additions for a more stable hls stream
     ffmpeg -re -i pipe:0 \
         -c:v libx264 \
         -preset ultrafast \
         -tune zerolatency \
         -crf 23 \
         -g 30 \
+        -keyint_min 30 \
+        -sc_threshold 0 \
         -f hls \
         -hls_time "${HLS_TIME}" \
         -hls_list_size "${HLS_LIST_SIZE}" \
-        -hls_flags append_list+omit_endlist+discont_start \
+        -hls_flags delete_segments+append_list+temp_file+independent_segments \
         -hls_segment_filename "/share/ezviz_hls/seg_${SESSION_ID}_%03d.ts" \
         /share/ezviz_hls/stream.m3u8 2>&1 || true
 
