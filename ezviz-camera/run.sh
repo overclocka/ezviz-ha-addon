@@ -1,9 +1,10 @@
 #!/usr/bin/with-contenv bashio
 
-# Disable exit on error - we handle reconnection ourselves
 set +e
 
-# Get configuration from options
+# ============================================
+# CONFIG
+# ============================================
 EMAIL=$(bashio::config 'email')
 PASSWORD=$(bashio::config 'password')
 SERIAL=$(bashio::config 'serial')
@@ -13,67 +14,30 @@ HLS_LIST_SIZE=$(bashio::config 'hls_list_size')
 ON_DEMAND=$(bashio::config 'on_demand')
 IDLE_TIMEOUT=$(bashio::config 'idle_timeout')
 
-# Create HLS directory
+# ============================================
+# PREP
+# ============================================
 mkdir -p /share/ezviz_hls
 
 bashio::log.info "Starting EZVIZ Camera HLS Stream..."
-bashio::log.info "Email: ${EMAIL}"
 bashio::log.info "Serial: ${SERIAL}"
 bashio::log.info "Region: ${REGION}"
 bashio::log.info "On-demand mode: ${ON_DEMAND}"
 
-# Clean start - only on first boot
+# IMPORTANT: DO NOT pre-create m3u8 (prevents race conditions)
 rm -f /share/ezviz_hls/*.ts /share/ezviz_hls/*.m3u8
 
-# Print access instructions
-bashio::log.info "============================================"
-bashio::log.info "HLS Stream URL: http://homeassistant.local:8080/stream.m3u8"
-bashio::log.info ""
-bashio::log.info "To add camera in Home Assistant UI:"
-bashio::log.info "1. Go to Settings -> Devices & Services"
-bashio::log.info "2. Add Integration -> Generic Camera"
-bashio::log.info "3. Stream Source: http://homeassistant.local:8080/stream.m3u8"
-bashio::log.info "4. Or use your HA IP: http://<HA_IP>:8080/stream.m3u8"
-if [ "${ON_DEMAND}" = "true" ]; then
-    bashio::log.info ""
-    bashio::log.info "ON-DEMAND MODE ENABLED (battery saver)"
-    bashio::log.info "Stream starts when you view the camera"
-    bashio::log.info "Stops after ${IDLE_TIMEOUT}s of inactivity"
-    bashio::log.info "Status endpoint: http://homeassistant.local:8080/status"
-fi
-bashio::log.info "============================================"
-
 # ============================================
-# ON-DEMAND MODE (for battery-powered cameras)
+# HTTP SERVER
 # ============================================
-if [ "${ON_DEMAND}" = "true" ]; then
-    bashio::log.info "Running in on-demand mode..."
-
-    # Run the on-demand stream manager (handles everything)
-    exec python3 /app/stream_manager.py \
-        --port 8080 \
-        --directory /share/ezviz_hls \
-        --email "${EMAIL}" \
-        --password "${PASSWORD}" \
-        --serial "${SERIAL}" \
-        --region "${REGION}" \
-        --hls-time "${HLS_TIME}" \
-        --hls-list-size "${HLS_LIST_SIZE}" \
-        --idle-timeout "${IDLE_TIMEOUT}"
-fi
-
-# ============================================
-# CONTINUOUS MODE (original behavior)
-# ============================================
-
-# Function to start HTTP server
 start_http_server() {
-    python3 /app/http_server.py --port 8080 --directory /share/ezviz_hls &
+    python3 /app/http_server.py \
+        --port 8080 \
+        --directory /share/ezviz_hls &
     HTTP_PID=$!
-    bashio::log.info "HTTP server (CORS enabled) started on port 8080 (PID: ${HTTP_PID})"
+    bashio::log.info "HTTP server started (PID: ${HTTP_PID})"
 }
 
-# Function to check and restart HTTP server if needed
 check_http_server() {
     if ! kill -0 "$HTTP_PID" 2>/dev/null; then
         bashio::log.warning "HTTP server died, restarting..."
@@ -81,33 +45,38 @@ check_http_server() {
     fi
 }
 
-# Start HTTP server with CORS support in background
-cd /share/ezviz_hls
+# small warmup to avoid early 404 spam
+sleep 2
 start_http_server
 
-# Use timestamp for unique session IDs
-TIMESTAMP=$(date +%s)
-
-# Main streaming loop with auto-restart
+# ============================================
+# STREAM LOOP
+# ============================================
 RESTART_COUNT=0
+
 while true; do
     RESTART_COUNT=$((RESTART_COUNT + 1))
-    bashio::log.info "[${RESTART_COUNT}] Starting stream..."
+    bashio::log.info "[${RESTART_COUNT}] Starting EZVIZ stream..."
 
-    # Unique segment prefix per session to avoid overwrites during reconnect
-    SESSION_ID="${TIMESTAMP}_${RESTART_COUNT}"
-    # Avoid broken streams
-    mkdir -p /share/ezviz_hls
-    echo "#EXTM3U" > /share/ezviz_hls/stream.m3u8
-    # Start streaming (stderr goes to log, stdout pipes to ffmpeg)
-    # || true ensures the loop continues even if ffmpeg exits with error
-    python3 -u /app/stream_to_pipe.py \
-        --email "${EMAIL}" \
-        --password "${PASSWORD}" \
-        --serial "${SERIAL}" \
-        --region "${REGION}" | \
-    # Some additions for a more stable hls stream
-    ffmpeg -re -i pipe:0 \
+    # FIX: stable session (NO rotating IDs)
+    SESSION_ID="live"
+
+    # ============================================
+    # PIPE WRAPPER (CRITICAL FIX)
+    # prevents ffmpeg from dying on 0-byte drops
+    # ============================================
+    (
+        while true; do
+            python3 -u /app/stream_to_pipe.py \
+                --email "${EMAIL}" \
+                --password "${PASSWORD}" \
+                --serial "${SERIAL}" \
+                --region "${REGION}" || true
+
+            bashio::log.warning "EZVIZ pipe dropped → reconnecting in 2s..."
+            sleep 2
+        done
+    ) | ffmpeg -re -i pipe:0 \
         -c:v libx264 \
         -preset ultrafast \
         -tune zerolatency \
@@ -118,17 +87,16 @@ while true; do
         -f hls \
         -hls_time "${HLS_TIME}" \
         -hls_list_size "${HLS_LIST_SIZE}" \
-        -hls_flags delete_segments+append_list+temp_file+independent_segments \
-        -hls_segment_filename "/share/ezviz_hls/seg_${SESSION_ID}_%03d.ts" \
+        -hls_flags append_list+independent_segments+temp_file+omit_endlist \
+        -hls_segment_filename "/share/ezviz_hls/seg_%03d.ts" \
         /share/ezviz_hls/stream.m3u8 2>&1 || true
 
-    # Clean up old segments (keep last 30)
-    ls -1t /share/ezviz_hls/*.ts 2>/dev/null | tail -n +31 | xargs -r rm -f
+    bashio::log.warning "FFmpeg exited → restarting stream..."
 
-    # Check if HTTP server is still alive, restart if needed
+    # cleanup only OLD segments (safe)
+    ls -1t /share/ezviz_hls/*.ts 2>/dev/null | tail -n +50 | xargs -r rm -f
+
     check_http_server
 
-    # Stream ended, quick restart
-    bashio::log.warning "Stream ended. Quick restart..."
-    sleep 0.5
+    sleep 1
 done
